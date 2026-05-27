@@ -5,9 +5,6 @@ use serde_json::Value;
 use std::path::Path;
 use thiserror::Error;
 
-#[cfg(feature = "polars")]
-use polars::prelude::*;
-
 use super::query_engine::QueryResult;
 
 #[derive(Error, Debug)]
@@ -47,97 +44,9 @@ pub fn export_query_result(
     }
 }
 
-/// Convert QueryResult to Polars DataFrame
-#[cfg(feature = "polars")]
-fn query_result_to_dataframe(result: &QueryResult) -> Result<DataFrame, ExportError> {
-    let mut series_map = Vec::new();
-
-    for (col_idx, col_name) in result.columns.iter().enumerate() {
-        let mut string_values = Vec::new();
-        let mut uint64_values = Vec::new();
-        let mut float64_values = Vec::new();
-
-        for row in &result.rows {
-            if col_idx < row.len() {
-                match &row[col_idx] {
-                    Value::String(s) => {
-                        string_values.push(s.as_str());
-                        uint64_values.push(0);
-                        float64_values.push(0.0);
-                    }
-                    Value::Number(n) => {
-                        if n.is_i64() || n.is_u64() {
-                            string_values.push("");
-                            uint64_values.push(n.as_u64().unwrap_or(0));
-                            float64_values.push(0.0);
-                        } else {
-                            string_values.push("");
-                            uint64_values.push(0);
-                            float64_values.push(n.as_f64().unwrap_or(0.0));
-                        }
-                    }
-                    Value::Bool(b) => {
-                        string_values.push(if *b { "true" } else { "false" });
-                        uint64_values.push(if *b { 1 } else { 0 });
-                        float64_values.push(if *b { 1.0 } else { 0.0 });
-                    }
-                    Value::Null => {
-                        string_values.push("");
-                        uint64_values.push(0);
-                        float64_values.push(0.0);
-                    }
-                    _ => {
-                        string_values.push(&row[col_idx].to_string());
-                        uint64_values.push(0);
-                        float64_values.push(0.0);
-                    }
-                }
-            }
-        }
-
-        // Determine type based on data
-        let has_strings = string_values.iter().any(|s| !s.is_empty());
-        let has_uints = uint64_values.iter().any(|&n| n > 0);
-        let has_floats = float64_values.iter().any(|&f| f > 0.0);
-
-        let series: Series = if has_strings {
-            StringChunked::new(col_name, &string_values).into_series()
-        } else if has_floats {
-            Float64Chunked::new(col_name, &float64_values).into_series()
-        } else if has_uints {
-            UInt64Chunked::new(col_name, &uint64_values).into_series()
-        } else {
-            StringChunked::new(col_name, &string_values).into_series()
-        };
-
-        series_map.push(series);
-    }
-
-    DataFrame::new(series_map)
-        .map_err(|e| ExportError::Polars(e.to_string()))
-}
-
 /// Export to Parquet format
-fn export_to_parquet(result: &QueryResult, path: &Path) -> Result<(), ExportError> {
-    #[cfg(feature = "polars")]
-    {
-        let df = query_result_to_dataframe(result)?;
-
-        let file = std::fs::File::create(path)
-            .map_err(|e| ExportError::Io(e.to_string()))?;
-        
-        ParquetWriter::new(file)
-            .finish(&mut df.clone())
-            .map_err(|e| ExportError::Polars(e.to_string()))?;
-
-        Ok(())
-    }
-
-    #[cfg(not(feature = "polars"))]
-    {
-        let _ = path; // Suppress unused warning when feature is disabled
-        Err(ExportError::Polars("Polars feature not enabled".to_string()))
-    }
+fn export_to_parquet(_result: &QueryResult, _path: &Path) -> Result<(), ExportError> {
+    Err(ExportError::Polars("Polars export not implemented".to_string()))
 }
 
 /// Export to JSON format
@@ -183,33 +92,11 @@ fn export_to_csv(result: &QueryResult, path: &Path) -> Result<(), ExportError> {
 }
 
 /// Export multiple query results to a single Parquet file
-#[cfg(feature = "polars")]
 pub fn export_multiple_to_parquet(
-    results: Vec<QueryResult>,
-    path: &Path,
+    _results: Vec<QueryResult>,
+    _path: &Path,
 ) -> Result<(), ExportError> {
-    if results.is_empty() {
-        return Err(ExportError::NoData);
-    }
-
-    let mut dfs = Vec::new();
-    for result in &results {
-        let df = query_result_to_dataframe(result)?;
-        dfs.push(df);
-    }
-
-    // Concatenate all dataframes
-    let combined_df = polars::functions::concat(&dfs, false)
-        .map_err(|e| ExportError::Polars(e.to_string()))?;
-
-    let file = std::fs::File::create(path)
-        .map_err(|e| ExportError::Io(e.to_string()))?;
-    
-    ParquetWriter::new(file)
-        .finish(&mut combined_df.clone())
-        .map_err(|e| ExportError::Polars(e.to_string()))?;
-
-    Ok(())
+    Err(ExportError::Polars("Polars export not implemented".to_string()))
 }
 
 #[cfg(test)]

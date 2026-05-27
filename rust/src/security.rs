@@ -93,6 +93,7 @@ impl InputValidator {
     }
     
     /// Validate a transaction
+    #[tracing::instrument(skip(self, tx), fields(tx_id = %tx.tx_id, sender = %tx.sender, amount = tx.amount))]
     pub fn validate_transaction(&self, tx: &Transaction) -> ValidationResult {
         let mut result = ValidationResult::new();
         
@@ -169,6 +170,7 @@ impl InputValidator {
     }
     
     /// Validate a block
+    #[tracing::instrument(skip(self, block), fields(height = block.height, tx_count = block.transactions.len()))]
     pub fn validate_block(&self, block: &Block) -> ValidationResult {
         let mut result = ValidationResult::new();
         
@@ -239,6 +241,7 @@ impl RateLimiter {
     }
     
     /// Check if a request is allowed
+    #[tracing::instrument(skip(self))]
     pub async fn check(&self) -> bool {
         let mut tokens = self.tokens.write().await;
         let mut last_refill = self.last_refill.write().await;
@@ -282,6 +285,7 @@ impl IpRateLimiter {
     }
     
     /// Check if an IP is rate limited
+    #[tracing::instrument(skip(self), fields(ip = %ip))]
     pub async fn check(&self, ip: IpAddr) -> bool {
         // First, get or create the limiter
         let limiter = {

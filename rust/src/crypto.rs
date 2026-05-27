@@ -92,6 +92,7 @@ impl PublicKey {
     }
     
     /// Verify a signature using real Ed25519 verification
+    #[tracing::instrument(skip(self, message, signature), fields(pk_hash = %self.to_hex()[..8]))]
     pub fn verify(&self, message: &[u8], signature: &DigitalSignature) -> Result<(), CryptoError> {
         let verifying_key = VerifyingKey::from_bytes(self.as_bytes())
             .map_err(|_| CryptoError::InvalidPublicKey)?;
@@ -127,6 +128,7 @@ impl PrivateKey {
     }
     
     /// Sign a message using real Ed25519 signing
+    #[tracing::instrument(skip(self, message))]
     pub fn sign(&self, message: &[u8]) -> DigitalSignature {
         let signing_key = SigningKey::from_bytes(self.as_bytes());
         let signature = signing_key.sign(message);
@@ -136,6 +138,7 @@ impl PrivateKey {
 
 impl KeyPair {
     /// Generate new key pair using real Ed25519
+    #[tracing::instrument]
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -146,11 +149,13 @@ impl KeyPair {
     }
     
     /// Sign a message
+    #[tracing::instrument(skip(self, message))]
     pub fn sign(&self, message: &[u8]) -> DigitalSignature {
         self.private_key.sign(message)
     }
     
     /// Verify a signature
+    #[tracing::instrument(skip(self, message, signature))]
     pub fn verify(&self, message: &[u8], signature: &DigitalSignature) -> Result<(), CryptoError> {
         self.public_key.verify(message, signature)
     }

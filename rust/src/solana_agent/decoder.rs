@@ -1,6 +1,7 @@
 //! Account decoding for Solana programs
 //! Supports SPL Token, Metaplex, Anchor, and common program account types
 
+use base64::{Engine as _, engine::general_purpose};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -338,7 +339,8 @@ pub fn decode_from_rpc_response(account_data: &Value) -> Result<DecodedAccount, 
         .or_else(|| account_data["data"][0].as_str())
         .ok_or_else(|| DecodeError::Parse("Missing data field".to_string()))?;
 
-    let data = base64::decode(data_base64)
+    let data = general_purpose::STANDARD
+        .decode(data_base64)
         .map_err(|e| DecodeError::Base64(e.to_string()))?;
 
     decode_account(owner, &data)

@@ -49,6 +49,7 @@ impl BlockchainStorage {
     }
     
     /// Store a block
+    #[tracing::instrument(skip(self, block), fields(height = block.height, tx_count = block.transactions.len()))]
     pub fn put_block(&self, block: &Block) -> Result<(), StorageError> {
         let key = format!("{}{}", std::str::from_utf8(BLOCK_PREFIX).unwrap(), block.height);
         let value = serde_json::to_vec(block)
@@ -63,6 +64,7 @@ impl BlockchainStorage {
     }
     
     /// Get a block by height
+    #[tracing::instrument(skip(self), fields(height = height))]
     pub fn get_block(&self, height: u64) -> Result<Option<Block>, StorageError> {
         let key = format!("{}{}", std::str::from_utf8(BLOCK_PREFIX).unwrap(), height);
         
@@ -77,6 +79,7 @@ impl BlockchainStorage {
     }
     
     /// Store a transaction
+    #[tracing::instrument(skip(self, tx), fields(tx_id = %tx.tx_id))]
     pub fn put_transaction(&self, tx: &Transaction) -> Result<(), StorageError> {
         let key = format!("{}{}", std::str::from_utf8(TRANSACTION_PREFIX).unwrap(), tx.tx_id);
         let value = serde_json::to_vec(tx)
@@ -87,6 +90,7 @@ impl BlockchainStorage {
     }
     
     /// Get a transaction by ID
+    #[tracing::instrument(skip(self), fields(tx_id = tx_id))]
     pub fn get_transaction(&self, tx_id: &str) -> Result<Option<Transaction>, StorageError> {
         let key = format!("{}{}", std::str::from_utf8(TRANSACTION_PREFIX).unwrap(), tx_id);
         
@@ -101,6 +105,7 @@ impl BlockchainStorage {
     }
     
     /// Store the current state
+    #[tracing::instrument(skip(self, state), fields(balance_count = state.balances.len()))]
     pub fn put_state(&self, state: &State) -> Result<(), StorageError> {
         let value = serde_json::to_vec(state)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -110,6 +115,7 @@ impl BlockchainStorage {
     }
     
     /// Get the current state
+    #[tracing::instrument(skip(self))]
     pub fn get_state(&self) -> Result<Option<State>, StorageError> {
         match self.db.get(STATE_KEY)? {
             Some(value) => {
@@ -136,6 +142,7 @@ impl BlockchainStorage {
     }
     
     /// Batch write multiple blocks
+    #[tracing::instrument(skip(self, blocks), fields(batch_len = blocks.len()))]
     pub fn put_blocks_batch(&self, blocks: &[Block]) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
         
