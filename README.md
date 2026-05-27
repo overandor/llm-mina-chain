@@ -1,5 +1,7 @@
 # LLM-Mina-Chain
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/overandor/llm-mina-chain)
+
 A Rust blockchain prototype plus a working Solana query agent. The fastest deployable path in this repo is the Solana agent, which exposes RPC-backed chain queries over CLI and HTTP.
 
 ## What To Deploy
