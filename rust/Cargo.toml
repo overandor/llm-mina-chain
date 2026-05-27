@@ -1,0 +1,99 @@
+[package]
+name = "llm-mina-chain"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+network = ["libp2p"]
+
+[dependencies]
+# Core crypto
+sha2 = "0.10"
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+rand = "0.8"
+rand_core = "0.6"
+hex = "0.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = "0.4"
+
+# Regex for LLM parsing
+regex = "1.10"
+
+# Persistent storage
+rocksdb = "0.21"
+thiserror = "1.0"
+tempfile = "3.8"
+
+# P2P networking
+libp2p = { version = "0.53", features = ["tokio", "gossipsub", "mdns", "noise", "yamux", "quic", "tcp", "macros"], optional = true }
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
+# Solana Agent
+reqwest = { version = "0.11", features = ["json"] }
+axum = "0.6"
+tower = "0.4"
+
+# Metrics and monitoring
+prometheus = "0.13"
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+
+# Testing
+proptest = "1.4"
+
+# zk-SNARKs (arkworks)
+ark-ec = "0.4"
+ark-ff = "0.4"
+ark-poly = "0.4"
+ark-serialize = "0.4"
+ark-crypto-primitives = "0.4"
+ark-bn254 = "0.4"
+ark-groth16 = "0.4"
+ark-std = "0.4"
+
+# Logging and config
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+config = "0.14"
+
+# Merkle tree
+rs_merkle = "1.4"
+
+# Operational tooling
+uuid = { version = "1.0", features = ["v4"] }
+
+# WebAssembly
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Window", "Worker", "WorkerOptions", "MessageEvent"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[lib]
+name = "llm_mina_chain"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "llm-mina-node"
+path = "src/node.rs"
+
+[[example]]
+name = "one_node_demo"
+path = "examples/one_node_demo.rs"
+
+[[example]]
+name = "three_node_demo"
+path = "examples/three_node_demo.rs"
+
+[[bench]]
+name = "blockchain_bench"
+harness = false

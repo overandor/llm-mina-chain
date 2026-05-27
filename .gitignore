@@ -1,0 +1,7 @@
+rust/target/
+cpp/build/
+web/node_modules/
+web/dist/
+.DS_Store
+*.log
+*.tmp

@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: llm-mina-chain-solana-agent
+    runtime: rust
+    rootDir: rust
+    plan: starter
+    buildCommand: cargo build --release --bin solana-agent-server
+    startCommand: ./target/release/solana-agent-server
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        sync: false
+      - key: SOLANA_RPC_ENDPOINT
+        sync: false
