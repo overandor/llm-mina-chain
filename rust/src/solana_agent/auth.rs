@@ -2,8 +2,9 @@
 //! Supports API key authentication and request rate limiting
 
 use axum::{
+    body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, Request},
+    http::{Request, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -14,19 +15,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 /// Authentication configuration
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct AuthConfig {
     pub api_keys: Vec<String>,
     pub require_auth: bool,
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            api_keys: vec![],
-            require_auth: false,
-        }
-    }
 }
 
 impl AuthConfig {
@@ -122,19 +114,20 @@ impl RateLimiter {
 /// API key authentication middleware
 pub async fn api_key_auth_middleware(
     State(config): State<Arc<AuthConfig>>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
+    request: Request<Body>,
+    next: Next<Body>,
 ) -> Result<Response, StatusCode> {
     if !config.require_auth {
         return Ok(next.run(request).await);
     }
 
-    let api_key = headers
+    let api_key = request
+        .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .or_else(|| {
-            headers
+            request
+                .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
@@ -155,8 +148,8 @@ pub async fn api_key_auth_middleware(
 /// Rate limiting middleware
 pub async fn rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
-    request: Request,
-    next: Next,
+    request: Request<Body>,
+    next: Next<Body>,
 ) -> Result<Response, StatusCode> {
     // Use IP address or API key as identifier
     let identifier = request
@@ -170,7 +163,7 @@ pub async fn rate_limit_middleware(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
         })
-        .unwrap_or_else(|| {
+        .unwrap_or({
             // Fallback to a generic identifier if no API key
             "anonymous"
         });

@@ -263,7 +263,7 @@ fn decode_token_account_data(data: &[u8]) -> Result<DecodedAccount, DecodeError>
 
 /// Decode Metaplex metadata account
 fn decode_metaplex_account(data: &[u8]) -> Result<DecodedAccount, DecodeError> {
-    if data.len() < 1 {
+    if data.is_empty() {
         return Err(DecodeError::InvalidLength {
             expected: 1,
             actual: data.len(),
@@ -273,7 +273,7 @@ fn decode_metaplex_account(data: &[u8]) -> Result<DecodedAccount, DecodeError> {
     let key = data[0];
 
     // Metaplex metadata key is 4
-    if key == 4 && data.len() >= 1 + 32 + 32 + 4 + 4 + 4 + 2 + 1 + 1 + 1 {
+    if key == 4 && data.len() >= 82 {
         let update_authority = bs58::encode(&data[1..33]).into_string();
         let mint = bs58::encode(&data[33..65]).into_string();
 
