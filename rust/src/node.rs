@@ -1,6 +1,6 @@
-//! Blockchain node for LLM-Mina-Chain
+//! Blockchain node for LLM-Mina-Chain (core runtime — no AI layer)
 
-use llm_mina_chain::{Blockchain, Transaction, LLMTransactionParser};
+use llm_mina_chain::{Blockchain, Transaction};
 use std::io::{self, BufRead};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,7 +12,6 @@ fn main() {
     
     // Initialize blockchain
     let blockchain = Arc::new(Mutex::new(Blockchain::new()));
-    let parser = LLMTransactionParser::new();
     
     println!("✅ Blockchain initialized");
     println!("📊 Current state:");
@@ -49,14 +48,14 @@ fn main() {
             continue;
         }
         
-        handle_command(input, &blockchain, &parser);
+        handle_command(input, &blockchain);
     }
 }
 
-fn handle_command(input: &str, blockchain: &Arc<Mutex<Blockchain>>, parser: &LLMTransactionParser) {
+fn handle_command(input: &str, blockchain: &Arc<Mutex<Blockchain>>) {
     let parts: Vec<&str> = input.split_whitespace().collect();
     
-    match parts.get(0).map(|s| *s) {
+    match parts.first().copied() {
         Some("help") => print_help(),
         Some("state") => {
             let bc = blockchain.lock().unwrap();
@@ -137,45 +136,6 @@ fn handle_command(input: &str, blockchain: &Arc<Mutex<Blockchain>>, parser: &LLM
                 println!("Usage: gasless <sender> <receiver> <amount>");
             }
         }
-        Some("llm") => {
-            if parts.len() >= 2 {
-                let text = parts[1..].join(" ");
-                let bc = blockchain.lock().unwrap();
-                
-                let parsed = parser.parse(&text, Some("alice"));
-                println!("🤖 Parsed transaction:");
-                println!("   Confidence: {:.1}", parsed.confidence);
-                println!("   Explanation: {}", parsed.explanation);
-                println!("   Sender: {:?}", parsed.sender);
-                println!("   Receiver: {}", parsed.receiver);
-                println!("   Amount: {}", parsed.amount);
-                println!("   Gas: {:?}", parsed.gas_limit);
-                
-                if parsed.confidence > 0.5 {
-                    let nonce = bc.state.get_nonce(parsed.sender.as_deref().unwrap_or("alice"));
-                    let tx = Transaction::new(
-                        parsed.sender.unwrap_or_else(|| "alice".to_string()),
-                        parsed.receiver,
-                        parsed.amount,
-                        nonce,
-                        parsed.gas_limit,
-                        parsed.gas_price,
-                    );
-                    
-                    drop(bc);
-                    let mut bc = blockchain.lock().unwrap();
-                    if bc.add_transaction(tx.clone()) {
-                        println!("✅ Transaction added to pool: {}", tx.tx_id);
-                    } else {
-                        println!("❌ Transaction validation failed");
-                    }
-                }
-            } else {
-                println!("Usage: llm <natural language command>");
-                println!("Example: llm transfer 100 from alice to bob");
-                println!("Example: llm send 50 to bob gasless");
-            }
-        }
         Some("mine") => {
             let mut bc = blockchain.lock().unwrap();
             let txs = bc.transaction_pool.clone();
@@ -232,7 +192,6 @@ fn print_help() {
     println!("   chain             - Show entire blockchain");
     println!("   transfer <s> <r> <a>  - Create transfer transaction");
     println!("   gasless <s> <r> <a>   - Create gasless transaction");
-    println!("   llm <text>        - Parse natural language to transaction");
     println!("   mine              - Mine next block");
     println!("   pool              - Show transaction pool");
     println!("   gas [price]       - Set or get gas price");

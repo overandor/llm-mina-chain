@@ -1,11 +1,11 @@
 //! Security features: input validation, rate limiting, and audit logging
 
-use prometheus::{Counter, Histogram, IntCounter, IntGauge, Registry};
+use prometheus::{Histogram, IntCounter, Registry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 use crate::{Transaction, Block};
@@ -49,6 +49,12 @@ pub struct ValidationResult {
     pub valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+impl Default for ValidationResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ValidationResult {
@@ -139,9 +145,17 @@ impl InputValidator {
             result.add_error("Invalid receiver address".to_string());
         }
         
-        // Check signature if required
-        if self.config.require_signatures && tx.signature.is_none() {
-            result.add_error("Signature required but not provided".to_string());
+        // Check signature if required, and verify cryptographically when present
+        if self.config.require_signatures {
+            if tx.signature.is_none() {
+                result.add_error("Signature required but not provided".to_string());
+            } else if let Ok(public_key) = crate::PublicKey::from_hex(&tx.sender) {
+                if let Err(_e) = tx.verify_signature(&public_key) {
+                    result.add_error("Invalid transaction signature".to_string());
+                }
+            } else {
+                result.add_error("Invalid sender public key format".to_string());
+            }
         }
         
         // Update metrics

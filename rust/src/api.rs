@@ -22,7 +22,7 @@ impl ApiVersion {
     }
     
     /// Parse from string (e.g., "1.0.0")
-    pub fn from_str(s: &str) -> Result<Self, ApiError> {
+    pub fn parse_version(s: &str) -> Result<Self, ApiError> {
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return Err(ApiError::InvalidVersionFormat);
@@ -34,22 +34,19 @@ impl ApiVersion {
         
         Ok(ApiVersion::new(major, minor, patch))
     }
-    
-    /// Convert to string
-    pub fn to_string(&self) -> String {
-        format!("{}.{}.{}", self.major, self.minor, self.patch)
-    }
-    
-    /// Check if this version is compatible with another
-    /// Major version must match, minor can be >=, patch can be anything
-    pub fn is_compatible(&self, other: &ApiVersion) -> bool {
-        self.major == other.major && self.minor >= other.minor
-    }
 }
 
 impl std::fmt::Display for ApiVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl ApiVersion {
+    /// Check if this version is compatible with another
+    /// Major version must match, minor can be >=, patch can be anything
+    pub fn is_compatible(&self, other: &ApiVersion) -> bool {
+        self.major == other.major && self.minor >= other.minor
     }
 }
 
@@ -261,7 +258,7 @@ mod tests {
     
     #[test]
     fn test_api_version_parse() {
-        let v = ApiVersion::from_str("1.2.3").unwrap();
+        let v = ApiVersion::parse_version("1.2.3").unwrap();
         assert_eq!(v.major, 1);
         assert_eq!(v.minor, 2);
         assert_eq!(v.patch, 3);

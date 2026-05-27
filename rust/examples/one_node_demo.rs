@@ -106,10 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 6: Generate zk-SNARK Proof
     println!("\n--- Step 6: Generate zk-SNARK Proof ---");
     let circuit = StateTransitionCircuit::new(
-        ark_bn254::Fr::from(1u32),
-        ark_bn254::Fr::from(2u32),
+        ark_bn254::Fr::from(10u32),
+        ark_bn254::Fr::from(13u32),
         ark_bn254::Fr::from(3u32),
-        ark_bn254::Fr::from(block.height as u32),
     );
     let proof = proof_system.generate_proof(&circuit)?;
     println!("✓ zk-SNARK proof generated (hex: {})", proof.to_hex());

@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
+use tokio::task::JoinSet;
+use tracing::{debug, info};
 
+use super::query::{parse_query, planner::FilterValue};
 use super::rpc_client::{RpcError, SolanaRpcClient};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -38,12 +41,57 @@ impl QueryEngine {
         params: Option<HashMap<String, String>>,
     ) -> Result<QueryResult, RpcError> {
         let start = Instant::now();
+
+        // Try AST-based parser first
+        if let Ok(plan) = parse_query(query) {
+            let mut where_clauses: HashMap<String, String> = plan
+                .filters
+                .into_iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        FilterValue::String(s) => s,
+                        FilterValue::Number(n) => n.to_string(),
+                    };
+                    (k, s)
+                })
+                .collect();
+
+            // substitute params
+            if let Some(p) = params {
+                for v in where_clauses.values_mut() {
+                    if v.starts_with(':') {
+                        let key = v.trim_start_matches(':');
+                        if let Some(replacement) = p.get(key) {
+                            *v = replacement.clone();
+                        }
+                    }
+                }
+            }
+
+            let select: Vec<String> = plan
+                .projection
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let (columns, rows) = self.dispatch_table(&plan.table, &where_clauses, &select, plan.limit.map(|n| n as usize)).await?;
+            let row_count = rows.len();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            return Ok(QueryResult {
+                columns,
+                rows,
+                row_count,
+                execution_time_ms: elapsed,
+                query_type: plan.table,
+            });
+        }
+
+        // Fall back to regex-based parser
         let parsed = Self::parse(query);
 
         // substitute params
         let mut where_clauses = parsed.where_clauses.clone();
         if let Some(p) = params {
-            for (_k, v) in &mut where_clauses {
+            for v in where_clauses.values_mut() {
                 if v.starts_with(':') {
                     let key = v.trim_start_matches(':');
                     if let Some(replacement) = p.get(key) {
@@ -53,33 +101,9 @@ impl QueryEngine {
             }
         }
 
-        let (columns, rows) = match parsed.table.as_str() {
-            "accounts" => self.query_accounts(&where_clauses, &parsed.select).await?,
-            "transactions" => self.query_transactions(&where_clauses, &parsed.select).await?,
-            "blocks" => self.query_blocks(&where_clauses, &parsed.select).await?,
-            "token_accounts" => {
-                self.query_token_accounts(&where_clauses, &parsed.select).await?
-            }
-            "program_accounts" => {
-                self.query_program_accounts(&where_clauses, &parsed.select).await?
-            }
-            "status" => self.query_status(&parsed.select).await?,
-            "epoch_info" => self.query_epoch_info(&parsed.select).await?,
-            "supply" => self.query_supply(&parsed.select).await?,
-            "vote_accounts" => self.query_vote_accounts(&parsed.select).await?,
-            "cluster_nodes" => self.query_cluster_nodes(&parsed.select).await?,
-            "performance_samples" => {
-                self.query_performance_samples(parsed.limit.unwrap_or(10), &parsed.select)
-                    .await?
-            }
-            "token_supply" => self.query_token_supply(&where_clauses, &parsed.select).await?,
-            "inflation_reward" => {
-                self.query_inflation_reward(&where_clauses, &parsed.select).await?
-            }
-            "health" => self.query_health(&parsed.select).await?,
-            "version" => self.query_version(&parsed.select).await?,
-            _ => return Err(RpcError::Transport(format!("Unknown table: {}", parsed.table))),
-        };
+        let (columns, rows) = self
+            .dispatch_table(&parsed.table, &where_clauses, &parsed.select, parsed.limit)
+            .await?;
 
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         let row_count = rows.len();
@@ -90,6 +114,33 @@ impl QueryEngine {
             execution_time_ms: elapsed,
             query_type: parsed.table,
         })
+    }
+
+    async fn dispatch_table(
+        &self,
+        table: &str,
+        where_clauses: &HashMap<String, String>,
+        select: &[String],
+        limit: Option<usize>,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>), RpcError> {
+        match table {
+            "accounts" => self.query_accounts(where_clauses, select).await,
+            "transactions" => self.query_transactions(where_clauses, select).await,
+            "blocks" => self.query_blocks(where_clauses, select).await,
+            "token_accounts" => self.query_token_accounts(where_clauses, select).await,
+            "program_accounts" => self.query_program_accounts(where_clauses, select).await,
+            "status" => self.query_status(select).await,
+            "epoch_info" => self.query_epoch_info(select).await,
+            "supply" => self.query_supply(select).await,
+            "vote_accounts" => self.query_vote_accounts(select).await,
+            "cluster_nodes" => self.query_cluster_nodes(select).await,
+            "performance_samples" => self.query_performance_samples(limit.unwrap_or(10), select).await,
+            "token_supply" => self.query_token_supply(where_clauses, select).await,
+            "inflation_reward" => self.query_inflation_reward(where_clauses, select).await,
+            "health" => self.query_health(select).await,
+            "version" => self.query_version(select).await,
+            _ => Err(RpcError::Transport(format!("Unknown table: {}", table))),
+        }
     }
 
     fn parse(query: &str) -> ParsedQuery {
@@ -115,8 +166,10 @@ impl QueryEngine {
         // WHERE
         if let Some(caps) = Regex::new(r"where\s+(.+?)(?:\s+limit\s+|$)").unwrap().captures(&q) {
             let raw = caps.get(1).unwrap().as_str().trim();
+            let cond_regex = Regex::new(r"(\w+)\s*=\s*(.+)")
+                .expect("hardcoded regex is valid");
             for cond in raw.split(" and ") {
-                if let Some(caps) = Regex::new(r"(\w+)\s*=\s*(.+)").unwrap().captures(cond.trim()) {
+                if let Some(caps) = cond_regex.captures(cond.trim()) {
                     let key = caps.get(1).unwrap().as_str().to_string();
                     let val = caps
                         .get(2)
@@ -209,7 +262,7 @@ impl QueryEngine {
             .get_token_accounts_by_owner(owner, mint, "confirmed")
             .await?;
         let items = result["value"].as_array().cloned().unwrap_or_default();
-        let rows: Vec<HashMap<String, Value>> = items.iter().map(|v| flatten_token_account(v)).collect();
+        let rows: Vec<HashMap<String, Value>> = items.iter().map(flatten_token_account).collect();
         if rows.is_empty() {
             return Ok((vec!["pubkey".into()], vec![]));
         }
@@ -384,7 +437,7 @@ impl QueryEngine {
             .get("pubkey")
             .ok_or_else(|| RpcError::Transport("inflation_reward requires pubkey".into()))?;
         let epoch = where_clauses.get("epoch").and_then(|s| s.parse().ok());
-        let rewards = self.client.get_inflation_reward(&[pubkey.clone()], epoch).await?;
+        let rewards = self.client.get_inflation_reward(std::slice::from_ref(pubkey), epoch).await?;
         let arr = rewards.as_array().cloned().unwrap_or_default();
         let mut row = if let Some(first) = arr.first() {
             flatten_dict(first, "")
@@ -429,7 +482,7 @@ fn pick_columns(select: &[String], row: &HashMap<String, Value>) -> Vec<String> 
         keys.sort();
         keys
     } else {
-        select.iter().cloned().collect()
+        select.to_vec()
     }
 }
 
@@ -524,4 +577,82 @@ fn flatten_dict(value: &Value, prefix: &str) -> HashMap<String, Value> {
         }
     }
     result
+}
+
+/// Execute multiple account lookups in parallel
+pub async fn get_accounts_parallel(
+    client: &SolanaRpcClient,
+    pubkeys: Vec<String>,
+    commitment: &str,
+) -> Result<Vec<(String, Value)>, RpcError> {
+    let start = Instant::now();
+    debug!("Starting parallel account lookup for {} accounts", pubkeys.len());
+
+    let mut join_set = JoinSet::new();
+
+    for pubkey in pubkeys {
+        let client_clone = client.clone();
+        let commitment = commitment.to_string();
+        join_set.spawn(async move {
+            let result = client_clone.get_account_info(&pubkey, &commitment).await;
+            (pubkey, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((pubkey, Ok(account))) => {
+                results.push((pubkey, account));
+            }
+            Ok((pubkey, Err(e))) => {
+                debug!("Failed to fetch account {}: {}", pubkey, e);
+            }
+            Err(e) => {
+                debug!("Task failed: {}", e);
+            }
+        }
+    }
+
+    info!("Parallel account lookup completed: {} accounts in {:?}", results.len(), start.elapsed());
+    Ok(results)
+}
+
+/// Execute multiple transaction lookups in parallel
+pub async fn get_transactions_parallel(
+    client: &SolanaRpcClient,
+    signatures: Vec<String>,
+    commitment: &str,
+) -> Result<Vec<(String, Value)>, RpcError> {
+    let start = Instant::now();
+    debug!("Starting parallel transaction lookup for {} transactions", signatures.len());
+
+    let mut join_set = JoinSet::new();
+
+    for signature in signatures {
+        let client_clone = client.clone();
+        let commitment = commitment.to_string();
+        join_set.spawn(async move {
+            let result = client_clone.get_transaction(&signature, &commitment).await;
+            (signature, result)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((signature, Ok(tx))) => {
+                results.push((signature, tx));
+            }
+            Ok((signature, Err(e))) => {
+                debug!("Failed to fetch transaction {}: {}", signature, e);
+            }
+            Err(e) => {
+                debug!("Task failed: {}", e);
+            }
+        }
+    }
+
+    info!("Parallel transaction lookup completed: {} transactions in {:?}", results.len(), start.elapsed());
+    Ok(results)
 }

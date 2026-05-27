@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query as AxumQuery, State},
+    extract::{Query as AxumQuery, State, ws::WebSocketUpgrade},
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{debug, error, info, instrument};
 
 use super::knowledge_base::SolanaKnowledgeBase;
 use super::query_engine::QueryEngine;
 use super::rpc_client::{RpcError, SolanaRpcClient};
+use super::stream::SolanaStreamClient;
 
 pub struct AppState {
     pub client: SolanaRpcClient,
@@ -42,6 +44,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/performance", get(performance))
         .route("/ask", post(ask_question))
         .route("/topics", get(list_topics))
+        .route("/ws/slots", get(ws_slots))
         .with_state(state)
 }
 
@@ -86,16 +89,25 @@ struct SqlQueryBody {
     params: Option<HashMap<String, String>>,
 }
 
+#[instrument(skip(state, body), fields(query = %body.query))]
 async fn sql_query_post(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SqlQueryBody>,
 ) -> (StatusCode, Json<Value>) {
+    debug!("Executing SQL query: {}", body.query);
     match state.engine.execute(&body.query, body.params).await {
-        Ok(r) => ok(r),
+        Ok(r) => {
+            info!("Query executed successfully, {} rows", r.row_count);
+            ok(r)
+        }
         Err(RpcError::Transport(msg)) if msg.contains("requires") || msg.contains("Unknown") => {
+            error!("Query parse error: {}", msg);
             bad_request(&msg)
         }
-        Err(e) => err(e),
+        Err(e) => {
+            error!("Query execution error: {}", e);
+            err(e)
+        }
     }
 }
 
@@ -377,12 +389,11 @@ async fn ask_question(
     };
 
     if req.include_onchain_data {
-        match tokio::try_join!(
+        if let Ok((slot, height, epoch)) = tokio::try_join!(
             state.client.get_slot("confirmed"),
             state.client.get_block_height("confirmed"),
             state.client.get_epoch_info()
         ) {
-            Ok((slot, height, epoch)) => {
                 let slot_index = epoch["slotIndex"].as_u64().unwrap_or(0);
                 let slots_in_epoch = epoch["slotsInEpoch"].as_u64().unwrap_or(1).max(1);
                 resp.onchain_data = Some(json!({
@@ -391,8 +402,6 @@ async fn ask_question(
                     "epoch": epoch["epoch"],
                     "epochProgress": slot_index as f64 / slots_in_epoch as f64,
                 }));
-            }
-            Err(_) => {}
         }
     }
 
@@ -403,4 +412,50 @@ async fn list_topics(
     State(state): State<Arc<AppState>>,
 ) -> Json<Value> {
     Json(json!({"topics": state.kb.list_topics() }))
+}
+
+/// WebSocket handler for streaming slot updates
+async fn ws_slots(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    ws.on_upgrade(|mut socket| async move {
+        // Connect to Solana WebSocket
+        let mut stream_client = SolanaStreamClient::new(state.client.endpoint().to_string());
+        if let Err(e) = stream_client.connect().await {
+            let _ = socket.send(axum::extract::ws::Message::Text(
+                json!({"error": format!("Failed to connect to Solana WS: {}", e)}).to_string(),
+            )).await;
+            return;
+        }
+
+        // Subscribe to slots
+        let mut slot_rx = match stream_client.subscribe_slots().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    json!({"error": format!("Failed to subscribe: {}", e)}).to_string(),
+                )).await;
+                return;
+            }
+        };
+
+        // Send initial confirmation
+        let _ = socket.send(axum::extract::ws::Message::Text(
+            json!({"status": "connected", "subscription": "slots"}).to_string(),
+        )).await;
+
+        // Forward slot events to WebSocket client
+        while let Ok(event) = slot_rx.recv().await {
+            let msg = json!({
+                "type": "slot",
+                "slot": event.slot,
+                "timestamp": event.timestamp,
+                "payload": event.payload,
+            });
+            if socket.send(axum::extract::ws::Message::Text(msg.to_string())).await.is_err() {
+                break;
+            }
+        }
+    })
 }

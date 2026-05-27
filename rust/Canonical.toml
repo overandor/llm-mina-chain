@@ -1,0 +1,94 @@
+# Canonical Configuration for LLM-Mina-Chain
+# This file is the single source of truth for runtime constants.
+# NO AGENT may change values here without three-agent review.
+
+[chain]
+# Chain identifier
+chain_id = "llm-mina-chain-dev-001"
+# Genesis block timestamp (Unix seconds)
+genesis_timestamp = 1700000000
+# Block time target in seconds
+block_time_target = 5
+# Minimum gas price
+min_gas_price = 1
+# Maximum transaction amount
+max_transaction_amount = 1000000000
+# Maximum gas limit per transaction
+max_gas_limit = 10000000
+
+[crypto]
+# Hash algorithm (SHA-256 only)
+hash_algorithm = "sha256"
+# Signature scheme (Ed25519 only)
+signature_scheme = "ed25519"
+# Key format (hex, 64 chars for public, 128 for private)
+key_format = "hex"
+
+[network]
+# libp2p protocol version
+protocol_version = "llm-mina-chain/0.1.0"
+# Gossipsub heartbeat interval (seconds)
+gossipsub_heartbeat = 10
+# mDNS discovery enabled
+mdns_enabled = true
+# TCP listen port
+tcp_port = 0  # 0 = random ephemeral
+# QUIC listen port
+quic_port = 0
+
+[consensus]
+# Consensus algorithm
+algorithm = "hotstuff"
+# View timeout (seconds)
+view_timeout = 4
+# Quorum threshold (2/3 + 1 for f = 1)
+# For n validators, quorum = floor(2n/3) + 1
+quorum_threshold = 3
+# Leader rotation: round-robin
+leader_rotation = "round_robin"
+
+[storage]
+# Persistent storage backend (rocksdb only)
+backend = "rocksdb"
+# Database path
+db_path = "./chain_db"
+# Snapshot interval (blocks)
+snapshot_interval = 1000
+# Max open files
+max_open_files = 512
+
+[logging]
+# Log format (json for production, pretty for dev)
+format = "json"
+# Default log level
+level = "info"
+# Structured fields always present
+required_fields = ["timestamp", "level", "target", "message", "trace_id"]
+
+[metrics]
+# Prometheus scrape interval (seconds)
+scrape_interval = 15
+# Metrics port
+port = 9090
+# Enabled metric families
+enabled = ["blockchain", "network", "consensus", "storage", "security"]
+
+[api]
+# Current API version
+version = "1.0.0"
+# Supported versions (backward compatibility window)
+supported_versions = ["1.0.0"]
+# Base path
+base_path = "/api/v1"
+# Rate limit (requests per second)
+rate_limit = 100
+
+[receipt]
+# Receipt schema version
+schema_version = "1.0.0"
+# Serialization format
+format = "json"
+# Hash included in receipt
+include_hash = true
+# Agent signature required
+require_agent_signature = true

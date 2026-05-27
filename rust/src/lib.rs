@@ -1,7 +1,12 @@
 //! LLM-Mina-Chain: A micro LLM-based blockchain with atomic instant transactions and optional gas
 //! Inspired by Mina Protocol's recursive proof system
 
+pub mod protocol;
+
+// Agent 2: Semantic / AI layer
 pub mod llm_layer;
+#[cfg(feature = "semantic")]
+pub mod semantic_runtime;
 pub mod crypto;
 pub mod storage;
 #[cfg(feature = "network")]
@@ -12,6 +17,9 @@ pub mod metrics;
 pub mod zkproof;
 pub mod api;
 pub mod health;
+
+// Agent 2: Solana query layer (NOT core runtime — loaded conditionally)
+#[cfg(feature = "solana")]
 pub mod solana_agent;
 
 #[cfg(target_arch = "wasm32")]
@@ -21,8 +29,6 @@ use sha2::{Sha256, Digest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use rand::Rng;
-
 pub use llm_layer::{LLMTransactionParser, ParsedTransaction, GasSuggestion};
 pub use crypto::{KeyPair, PublicKey, PrivateKey, DigitalSignature, CryptoError};
 pub use storage::{BlockchainStorage, StorageError};
@@ -31,7 +37,7 @@ pub use network::{P2PNode, NetworkConfig, NetworkMessage};
 pub use consensus::{HotStuffConsensus, ConsensusMessage, ConsensusAction, ConsensusError, Phase};
 pub use security::{InputValidator, SecurityConfig, ValidationResult, RateLimiter, IpRateLimiter, AuditLogger};
 pub use metrics::{BlockchainMetrics, MetricsServer, Timer};
-pub use zkproof::{ProofSystem, ZkProof, StateTransitionCircuit, ProofError, RecursiveProof, ProofCache};
+pub use zkproof::{ProofSystem, ZkProof, StateTransitionCircuit, ProofError};
 pub use api::{ApiVersion, ApiEndpoint, ApiRegistry, ApiHandler, ApiRequest, ApiResponse, ApiError};
 pub use health::{HealthChecker, HealthCheck, HealthStatus, HealthStatusResponse, AlertManager, Alert, AlertSeverity, SystemMetrics};
 
@@ -75,7 +81,20 @@ impl Transaction {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        
+        Self::new_with_timestamp(sender, receiver, amount, nonce, gas_limit, gas_price, timestamp)
+    }
+
+    /// Deterministic constructor: same inputs → same tx_id and hash.
+    /// Use this for replay, tests, and any scenario requiring determinism.
+    pub fn new_with_timestamp(
+        sender: String,
+        receiver: String,
+        amount: u64,
+        nonce: u64,
+        gas_limit: Option<u64>,
+        gas_price: Option<u64>,
+        timestamp: i64,
+    ) -> Self {
         let tx_id = Self::generate_id(&sender, &receiver, amount, nonce, timestamp);
         
         Transaction {
@@ -159,6 +178,12 @@ pub struct State {
     pub balances: HashMap<String, u64>,
     pub nonces: HashMap<String, u64>,
     pub contracts: HashMap<String, serde_json::Value>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl State {
@@ -254,10 +279,8 @@ impl Block {
         previous_hash: String,
         state_hash: String,
     ) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        // Deterministic timestamp for reproducible hashes
+        let timestamp = transactions.iter().map(|t| t.timestamp).max().unwrap_or(0) + 1;
         
         let mut block = Block {
             height,
@@ -343,6 +366,7 @@ impl Blockchain {
     }
     
     /// Add transaction to pool with immediate validation
+    #[tracing::instrument(skip(self, tx), fields(tx_id = %tx.tx_id, sender = %tx.sender, receiver = %tx.receiver, amount = tx.amount))]
     pub fn add_transaction(&mut self, tx: Transaction) -> bool {
         if !self.validate_transaction(&tx) {
             return false;
@@ -382,6 +406,7 @@ impl Blockchain {
     }
     
     /// Create new block with atomic transaction execution
+    #[tracing::instrument(skip(self, transactions), fields(tx_count = transactions.len()))]
     pub fn create_block(&mut self, transactions: Vec<Transaction>) -> Option<Block> {
         // Create a copy of state for testing
         let mut test_state = State {
@@ -420,17 +445,12 @@ impl Blockchain {
     }
     
     fn generate_proof(&self, state: &State) -> String {
-        // In a real implementation, this would generate a zk-SNARK proof
-        // For this micro version, we use a hash as a placeholder
-        let mut rng = rand::thread_rng();
-        let random: u64 = rng.gen();
-        
+        // Deterministic placeholder proof: state hash + next height.
+        // In production this becomes a real zk-SNARK.
         let data = format!(
-            "{}{}{}{}",
+            "{}{}",
             state.hash(),
             self.get_latest_block().height + 1,
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            random
         );
         
         let mut hasher = Sha256::new();
@@ -444,6 +464,92 @@ impl Blockchain {
     
     pub fn get_gas_price(&self) -> u64 {
         self.gas_price
+    }
+    
+    /// Replay the entire blockchain from genesis, rebuilding state.
+    /// Returns the recomputed state. If `expected_state` is provided,
+    /// asserts that the replayed state matches.
+    ///
+    /// This is the foundation of deterministic execution and audit.
+    #[tracing::instrument(skip(self, expected_state), fields(chain_len = self.chain.len()))]
+    pub fn replay(&self, expected_state: Option<&State>) -> Result<State, String> {
+        let mut replayed = State::new();
+
+        // Apply genesis balances (must match create_genesis_block exactly)
+        replayed.set_balance("genesis".to_string(), 1_000_000);
+        replayed.set_balance("alice".to_string(), 1_000);
+        replayed.set_balance("bob".to_string(), 1_000);
+
+        // Skip genesis block (index 0), replay every subsequent block
+        for block in self.chain.iter().skip(1) {
+            for tx in &block.transactions {
+                if !replayed.apply_transaction(tx) {
+                    return Err(format!(
+                        "replay failed at block {}: tx {} could not be applied",
+                        block.height, tx.tx_id
+                    ));
+                }
+            }
+        }
+
+        if let Some(expected) = expected_state {
+            if replayed.balances != expected.balances {
+                return Err("replay state mismatch: balances differ".to_string());
+            }
+            if replayed.nonces != expected.nonces {
+                return Err("replay state mismatch: nonces differ".to_string());
+            }
+        }
+
+        Ok(replayed)
+    }
+
+    /// Verify chain integrity: every block hash links to previous,
+    /// and re-executing all transactions reproduces the current state.
+    #[tracing::instrument(skip(self), fields(chain_len = self.chain.len()))]
+    pub fn verify_chain(&self) -> Result<(), String> {
+        if self.chain.is_empty() {
+            return Err("empty chain".to_string());
+        }
+
+        // Verify genesis block
+        let genesis = &self.chain[0];
+        if genesis.height != 0 {
+            return Err("genesis height must be 0".to_string());
+        }
+
+        // Verify linkage and hashes
+        for i in 1..self.chain.len() {
+            let prev = &self.chain[i - 1];
+            let curr = &self.chain[i];
+
+            if curr.height != prev.height + 1 {
+                return Err(format!(
+                    "height discontinuity at {}: expected {}, got {}",
+                    i, prev.height + 1, curr.height
+                ));
+            }
+
+            if curr.previous_hash != prev.block_hash {
+                return Err(format!(
+                    "hash linkage broken at block {}: expected prev_hash {}, got {}",
+                    curr.height, prev.block_hash, curr.previous_hash
+                ));
+            }
+
+            let recomputed = curr.compute_hash();
+            if recomputed != curr.block_hash {
+                return Err(format!(
+                    "block hash mismatch at height {}: stored {}, recomputed {}",
+                    curr.height, curr.block_hash, recomputed
+                ));
+            }
+        }
+
+        // Verify state by replay
+        self.replay(Some(&self.state))?;
+
+        Ok(())
     }
 }
 

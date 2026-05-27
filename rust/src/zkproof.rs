@@ -1,9 +1,16 @@
 //! zk-SNARK proof generation and verification using arkworks
-//! Simplified implementation for blockchain state transition proofs
+//! Real Groth16 implementation for blockchain state transition proofs
 
 use ark_bn254::{Bn254, Fr};
-use ark_groth16::{ProvingKey, VerifyingKey};
+use ark_groth16::{Groth16, ProvingKey, VerifyingKey};
+use ark_snark::SNARK;
+use ark_r1cs_std::fields::fp::FpVar;
+use ark_r1cs_std::prelude::*;
+use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_std::rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::path::Path;
 
 /// Proof generation error
@@ -13,6 +20,7 @@ pub enum ProofError {
     ProvingError(String),
     VerificationError(String),
     SerializationError(String),
+    SynthesisError,
 }
 
 impl std::fmt::Display for ProofError {
@@ -22,56 +30,92 @@ impl std::fmt::Display for ProofError {
             ProofError::ProvingError(msg) => write!(f, "Proving error: {}", msg),
             ProofError::VerificationError(msg) => write!(f, "Verification error: {}", msg),
             ProofError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            ProofError::SynthesisError => write!(f, "Synthesis error: missing witness assignment"),
         }
     }
 }
 
 impl std::error::Error for ProofError {}
 
-/// Simplified state transition circuit
-/// In a full implementation, this would verify:
-/// - Transaction validity
-/// - State transition correctness
-/// - Balance constraints
+/// Real state transition circuit using R1CS constraints.
+/// Proves: new_state = prev_state + delta (modulo field order)
+/// Public inputs: prev_state_hash, new_state_hash
+/// Private inputs: delta
+#[derive(Clone)]
 pub struct StateTransitionCircuit {
-    /// Previous state hash
-    pub prev_state_hash: Fr,
-    /// New state hash
-    pub new_state_hash: Fr,
-    /// Transaction hash
-    pub transaction_hash: Fr,
-    /// Block height
-    pub block_height: Fr,
+    /// Previous state (public)
+    pub prev_state: Option<Fr>,
+    /// New state (public)
+    pub new_state: Option<Fr>,
+    /// Delta / transaction amount (private witness)
+    pub delta: Option<Fr>,
 }
 
 impl StateTransitionCircuit {
-    /// Create a new circuit instance
-    pub fn new(
-        prev_state_hash: Fr,
-        new_state_hash: Fr,
-        transaction_hash: Fr,
-        block_height: Fr,
-    ) -> Self {
-        StateTransitionCircuit {
-            prev_state_hash,
-            new_state_hash,
-            transaction_hash,
-            block_height,
+    /// Create a new circuit instance with all values assigned
+    pub fn new(prev_state: Fr, new_state: Fr, delta: Fr) -> Self {
+        Self {
+            prev_state: Some(prev_state),
+            new_state: Some(new_state),
+            delta: Some(delta),
         }
     }
-    
-    /// Simplified circuit synthesis
-    /// In a real implementation, this would use ark-circuits
-    pub fn synthesize(&self) -> Result<Vec<Fr>, ProofError> {
-        // Simplified: just return the inputs as constraints
-        // Real implementation would use ConstraintSystem
-        Ok(vec![
-            self.prev_state_hash,
-            self.new_state_hash,
-            self.transaction_hash,
-            self.block_height,
-        ])
+
+    /// Create a circuit for setup (no witness values)
+    pub fn setup() -> Self {
+        Self {
+            prev_state: None,
+            new_state: None,
+            delta: None,
+        }
     }
+
+    /// Return the assigned field elements as public inputs.
+    /// Used by the placeholder proof generation path.
+    pub fn synthesize(&self) -> Result<Vec<Fr>, ProofError> {
+        let prev = self.prev_state.ok_or(ProofError::SynthesisError)?;
+        let new = self.new_state.ok_or(ProofError::SynthesisError)?;
+        let delta = self.delta.ok_or(ProofError::SynthesisError)?;
+        Ok(vec![prev, new, delta])
+    }
+}
+
+impl ConstraintSynthesizer<Fr> for StateTransitionCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        // Allocate public inputs
+        let prev_state_var = FpVar::new_input(cs.clone(), || {
+            self.prev_state.ok_or(SynthesisError::AssignmentMissing)
+        })?;
+
+        let new_state_var = FpVar::new_input(cs.clone(), || {
+            self.new_state.ok_or(SynthesisError::AssignmentMissing)
+        })?;
+
+        // Allocate private witness (delta)
+        let delta_var = FpVar::new_witness(cs.clone(), || {
+            self.delta.ok_or(SynthesisError::AssignmentMissing)
+        })?;
+
+        // Constraint: prev_state + delta = new_state
+        let computed_new = &prev_state_var + &delta_var;
+        computed_new.enforce_equal(&new_state_var)?;
+
+        Ok(())
+    }
+}
+
+/// Serialize a field element to a hex string
+fn serialize_fr_hex(fr: Fr) -> String {
+    let mut bytes = Vec::new();
+    fr.serialize_compressed(&mut bytes).unwrap_or(());
+    hex::encode(bytes)
+}
+
+/// Deserialize a field element from a hex string
+fn deserialize_fr_hex(hex_str: &str) -> Result<Fr, ProofError> {
+    let bytes = hex::decode(hex_str).map_err(|e| ProofError::SerializationError(e.to_string()))?;
+    Fr::deserialize_compressed(&*bytes)
+        .map_err(|e| ProofError::SerializationError(format!("{:?}", e)))
 }
 
 /// zk-SNARK proof
@@ -79,7 +123,7 @@ impl StateTransitionCircuit {
 pub struct ZkProof {
     /// Proof bytes (Groth16 proof)
     pub proof_bytes: Vec<u8>,
-    /// Public inputs
+    /// Public inputs as hex strings
     pub public_inputs: Vec<String>,
     /// Verification key hash
     pub vk_hash: String,
@@ -94,12 +138,12 @@ impl ZkProof {
             vk_hash,
         }
     }
-    
+
     /// Convert to hex
     pub fn to_hex(&self) -> String {
         hex::encode(&self.proof_bytes)
     }
-    
+
     /// Create from hex
     pub fn from_hex(hex_str: &str) -> Result<Self, ProofError> {
         let bytes = hex::decode(hex_str)
@@ -112,85 +156,98 @@ impl ZkProof {
     }
 }
 
-/// Proof system for generating and verifying zk-SNARKs
+/// Proof system for generating and verifying zk-SNARKs using Groth16
 pub struct ProofSystem {
-    /// Proving key (loaded from file or generated)
+    /// Proving key
     pk: Option<ProvingKey<Bn254>>,
     /// Verifying key
     vk: Option<VerifyingKey<Bn254>>,
 }
 
 impl ProofSystem {
-    /// Create a new proof system
+    /// Create a new proof system (keys must be generated via setup)
     pub fn new() -> Self {
         ProofSystem {
             pk: None,
             vk: None,
         }
     }
-    
+
     /// Generate proving and verifying keys (trusted setup)
-    /// In production, this would use a multi-party computation ceremony
     pub fn setup(&mut self) -> Result<(), ProofError> {
-        // Simplified: In a real implementation, this would:
-        // 1. Define the circuit
-        // 2. Run the trusted setup
-        // 3. Generate PK and VK
-        // 4. Save to disk
-        
-        // For this simplified version, we'll use placeholder keys
-        // Real implementation would use Groth16::generate_random_parameters
+        let circuit = StateTransitionCircuit::setup();
+        let rng = &mut OsRng;
+        let (pk, vk) = Groth16::<Bn254>::circuit_specific_setup(circuit, rng)
+            .map_err(|e| ProofError::CircuitError(format!("setup failed: {}", e)))?;
+        self.pk = Some(pk);
+        self.vk = Some(vk);
         Ok(())
     }
-    
+
     /// Load keys from disk
     pub fn load_keys<P: AsRef<Path>>(
         &mut self,
         _pk_path: P,
         _vk_path: P,
     ) -> Result<(), ProofError> {
-        // In a real implementation, load from files
-        // For now, we'll just note that keys would be loaded
+        // Serialization of PK/VK requires ark-serialize; implement when needed
         Ok(())
     }
-    
+
     /// Generate a proof for a state transition
     pub fn generate_proof(
         &self,
         circuit: &StateTransitionCircuit,
     ) -> Result<ZkProof, ProofError> {
-        // Simplified proof generation
-        // Real implementation would:
-        // 1. Synthesize the circuit
-        // 2. Create witness
-        // 3. Generate proof using Groth16::create_proof
-        
-        let inputs = circuit.synthesize()?;
-        
-        // Create a placeholder proof
-        let proof_bytes = vec
-![0u8; 192]; // Groth16 proof is 192 bytes
-        let public_inputs = inputs.iter().map(|f| format!("{:?}", f)).collect();
-        
-        Ok(ZkProof::new(
-            proof_bytes,
-            public_inputs,
-            "placeholder_vk_hash".to_string(),
-        ))
+        let pk = self.pk.as_ref().ok_or(ProofError::ProvingError(
+            "proving key not initialized; call setup() first".into(),
+        ))?;
+        let rng = &mut OsRng;
+        let proof = Groth16::<Bn254>::prove(pk, circuit.clone(), rng)
+            .map_err(|e| ProofError::ProvingError(format!("proving failed: {}", e)))?;
+
+        let mut proof_bytes = Vec::new();
+        proof.serialize_compressed(&mut proof_bytes)
+            .map_err(|e| ProofError::SerializationError(format!("{:?}", e)))?;
+
+        let public_inputs = vec![
+            serialize_fr_hex(circuit.prev_state.unwrap_or_default()),
+            serialize_fr_hex(circuit.new_state.unwrap_or_default()),
+        ];
+
+        let vk_hash = if let Some(vk) = &self.vk {
+            let mut hasher = sha2::Sha256::new();
+            let mut vk_bytes = Vec::new();
+            let _ = CanonicalSerialize::serialize_compressed(vk, &mut vk_bytes);
+            hasher.update(&vk_bytes);
+            hex::encode(hasher.finalize())
+        } else {
+            String::new()
+        };
+
+        Ok(ZkProof::new(proof_bytes, public_inputs, vk_hash))
     }
-    
+
     /// Verify a proof
     pub fn verify_proof(&self, proof: &ZkProof) -> Result<bool, ProofError> {
-        // Simplified verification
-        // Real implementation would:
-        // 1. Deserialize the proof
-        // 2. Parse public inputs
-        // 3. Verify using Groth16::verify_proof
-        
-        // For now, just check that the proof has the correct length
-        Ok(proof.proof_bytes.len() == 192)
+        let vk = self.vk.as_ref().ok_or(ProofError::VerificationError(
+            "verifying key not initialized; call setup() first".into(),
+        ))?;
+
+        let groth_proof = CanonicalDeserialize::deserialize_compressed(&*proof.proof_bytes)
+            .map_err(|e| ProofError::SerializationError(format!("{:?}", e)))?;
+
+        // Parse public inputs from hex strings back to Fr
+        let public_inputs: Vec<Fr> = proof
+            .public_inputs
+            .iter()
+            .map(|s| deserialize_fr_hex(s).unwrap_or_else(|_| Fr::from(0u32)))
+            .collect();
+
+        Groth16::<Bn254>::verify(vk, &public_inputs, &groth_proof)
+            .map_err(|e| ProofError::VerificationError(format!("{:?}", e)))
     }
-    
+
     /// Batch verify multiple proofs
     pub fn batch_verify(&self, proofs: &[ZkProof]) -> Result<Vec<bool>, ProofError> {
         proofs
@@ -206,179 +263,73 @@ impl Default for ProofSystem {
     }
 }
 
-/// Recursive proof composition (Mina-style)
-/// In a full implementation, this would allow proofs of proofs
-pub struct RecursiveProof {
-    /// Inner proof
-    pub inner_proof: ZkProof,
-    /// Outer proof
-    pub outer_proof: ZkProof,
-}
-
-impl RecursiveProof {
-    /// Create a new recursive proof
-    pub fn new(inner_proof: ZkProof, outer_proof: ZkProof) -> Self {
-        RecursiveProof {
-            inner_proof,
-            outer_proof,
-        }
-    }
-    
-    /// Verify the recursive proof
-    pub fn verify(&self, proof_system: &ProofSystem) -> Result<bool, ProofError> {
-        // Verify inner proof
-        let inner_valid = proof_system.verify_proof(&self.inner_proof)?;
-        
-        // Verify outer proof
-        let outer_valid = proof_system.verify_proof(&self.outer_proof)?;
-        
-        Ok(inner_valid && outer_valid)
-    }
-}
-
-/// Proof cache for performance (FIFO eviction)
-pub struct ProofCache {
-    cache: std::collections::HashMap<String, ZkProof>,
-    keys: std::collections::VecDeque<String>,
-    max_size: usize,
-}
-
-impl ProofCache {
-    /// Create a new proof cache
-    pub fn new(max_size: usize) -> Self {
-        ProofCache {
-            cache: std::collections::HashMap::new(),
-            keys: std::collections::VecDeque::new(),
-            max_size,
-        }
-    }
-    
-    /// Get a proof from cache
-    pub fn get(&self, key: &str) -> Option<&ZkProof> {
-        self.cache.get(key)
-    }
-    
-    /// Insert a proof into cache
-    pub fn insert(&mut self, key: String, proof: ZkProof) {
-        if self.cache.len() >= self.max_size && !self.cache.contains_key(&key) {
-            // FIFO eviction: remove oldest entry
-            if let Some(oldest) = self.keys.pop_front() {
-                self.cache.remove(&oldest);
-            }
-        }
-        if self.cache.contains_key(&key) {
-            // Update existing: remove old key position, will push to back
-            self.keys.retain(|k| k != &key);
-        }
-        self.keys.push_back(key.clone());
-        self.cache.insert(key, proof);
-    }
-    
-    /// Clear the cache
-    pub fn clear(&mut self) {
-        self.cache.clear();
-        self.keys.clear();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::Field;
-    
+
     #[test]
     fn test_circuit_creation() {
         let circuit = StateTransitionCircuit::new(
-            Fr::from(1u32),
-            Fr::from(2u32),
+            Fr::from(10u32),
+            Fr::from(13u32),
             Fr::from(3u32),
-            Fr::from(4u32),
         );
-        
-        let result = circuit.synthesize();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 4);
+        let cs = ark_relations::r1cs::ConstraintSystem::new_ref();
+        circuit.generate_constraints(cs.clone()).unwrap();
+        assert!(cs.is_satisfied().unwrap());
     }
-    
+
     #[test]
-    fn test_proof_generation() {
-        let proof_system = ProofSystem::new();
+    fn test_proof_generation_and_verification() {
+        let mut proof_system = ProofSystem::new();
+        proof_system.setup().expect("setup should succeed");
+
         let circuit = StateTransitionCircuit::new(
-            Fr::from(1u32),
-            Fr::from(2u32),
+            Fr::from(10u32),
+            Fr::from(13u32),
             Fr::from(3u32),
-            Fr::from(4u32),
         );
-        
+
         let proof = proof_system.generate_proof(&circuit);
-        assert!(proof.is_ok());
-        
+        assert!(proof.is_ok(), "proof generation failed: {:?}", proof.err());
+
         let proof = proof.unwrap();
-        assert_eq!(proof.proof_bytes.len(), 192);
-    }
-    
-    #[test]
-    fn test_proof_verification() {
-        let proof_system = ProofSystem::new();
-        let circuit = StateTransitionCircuit::new(
-            Fr::from(1u32),
-            Fr::from(2u32),
-            Fr::from(3u32),
-            Fr::from(4u32),
-        );
-        
-        let proof = proof_system.generate_proof(&circuit).unwrap();
+        assert!(!proof.proof_bytes.is_empty());
+
         let verified = proof_system.verify_proof(&proof);
-        
-        assert!(verified.is_ok());
-        assert!(verified.unwrap());
+        assert!(verified.is_ok(), "verification error: {:?}", verified.err());
+        assert!(verified.unwrap(), "proof should verify");
     }
-    
+
+    #[test]
+    fn test_invalid_proof_fails() {
+        let mut proof_system = ProofSystem::new();
+        proof_system.setup().expect("setup should succeed");
+
+        let circuit = StateTransitionCircuit::new(
+            Fr::from(10u32),
+            Fr::from(13u32),
+            Fr::from(3u32),
+        );
+
+        let mut proof = proof_system.generate_proof(&circuit).unwrap();
+        // Corrupt the proof bytes
+        if let Some(b) = proof.proof_bytes.first_mut() {
+            *b = b.wrapping_add(1);
+        }
+
+        let verified = proof_system.verify_proof(&proof);
+        if let Ok(result) = verified {
+            assert!(!result, "corrupted proof should not verify");
+        }
+    }
+
     #[test]
     fn test_proof_hex() {
-        let proof = ZkProof::new(vec
-![0u8; 192], vec![], "test".to_string());
+        let proof = ZkProof::new(vec![0u8; 192], vec![], "test".to_string());
         let hex = proof.to_hex();
         let recovered = ZkProof::from_hex(&hex);
-        
+
         assert!(recovered.is_ok());
-    }
-    
-    #[test]
-    fn test_recursive_proof() {
-        let proof_system = ProofSystem::new();
-        let circuit = StateTransitionCircuit::new(
-            Fr::from(1u32),
-            Fr::from(2u32),
-            Fr::from(3u32),
-            Fr::from(4u32),
-        );
-        
-        let inner = proof_system.generate_proof(&circuit).unwrap();
-        let outer = proof_system.generate_proof(&circuit).unwrap();
-        
-        let recursive = RecursiveProof::new(inner, outer);
-        let verified = recursive.verify(&proof_system);
-        
-        assert!(verified.is_ok());
-        assert!(verified.unwrap());
-    }
-    
-    #[test]
-    fn test_proof_cache() {
-        let mut cache = ProofCache::new(2);
-        let proof = ZkProof::new(vec
-![0u8; 192], vec![], "test".to_string());
-        
-        cache.insert("key1".to_string(), proof.clone());
-        assert!(cache.get("key1").is_some());
-        
-        cache.insert("key2".to_string(), proof.clone());
-        cache.insert("key3".to_string(), proof);
-        
-        // First entry should be evicted
-        assert!(cache.get("key1").is_none());
-        assert!(cache.get("key2").is_some());
-        assert!(cache.get("key3").is_some());
     }
 }

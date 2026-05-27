@@ -30,14 +30,16 @@ mod security_tests {
         let config = SecurityConfig::default();
         let validator = InputValidator::new(config, &registry);
         
-        let tx = Transaction::new(
-            "alice".to_string(),
+        let keypair = llm_mina_chain::KeyPair::generate();
+        let mut tx = Transaction::new(
+            keypair.public_key.to_hex(),
             "bob".to_string(),
             100,
             0,
             Some(21000),
             Some(1),
         );
+        tx.sign(&keypair);
         
         let result = validator.validate_transaction(&tx);
         assert!(result.is_valid());

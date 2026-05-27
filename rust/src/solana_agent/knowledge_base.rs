@@ -12,10 +12,16 @@ pub struct SolanaKnowledgeBase {
     topics: HashMap<String, Topic>,
 }
 
-pub(crate) struct Topic {
+pub struct Topic {
     keywords: Vec<String>,
     answer: String,
     sources: Vec<String>,
+}
+
+impl Default for SolanaKnowledgeBase {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SolanaKnowledgeBase {

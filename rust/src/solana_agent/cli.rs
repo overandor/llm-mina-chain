@@ -1,6 +1,6 @@
-use std::io::{self, Write};
-
 use serde_json::json;
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt};
+use tokio::signal;
 
 use super::knowledge_base::SolanaKnowledgeBase;
 use super::query_engine::QueryEngine;
@@ -54,30 +54,73 @@ pub async fn run_cli(endpoint: Option<String>) {
     let engine = QueryEngine::new(client.clone());
     let kb = SolanaKnowledgeBase::new();
 
-    println!("{}", BANNER);
-    println!("Connected to: {}\n", client.endpoint());
+    let mut stdout = io::stdout();
+    let stdin = io::stdin();
+    let mut reader = io::BufReader::new(stdin);
+    let mut line = String::new();
+
+    // Set up Ctrl-C handler using a broadcast channel
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    tokio::spawn(async move {
+        if signal::ctrl_c().await.is_ok() {
+            let _ = shutdown_tx.send(());
+        }
+    });
+
+    stdout.write_all(BANNER.as_bytes()).await.ok();
+    stdout
+        .write_all(format!("Connected to: {}\n\n", client.endpoint()).as_bytes())
+        .await
+        .ok();
+    stdout.flush().await.ok();
 
     loop {
-        print!("solana-agent> ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line).is_err() {
-            break;
+        stdout.write_all(b"solana-agent> ").await.ok();
+        stdout.flush().await.ok();
+        line.clear();
+
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                stdout.write_all(b"\nReceived Ctrl-C. Exiting...\n").await.ok();
+                stdout.flush().await.ok();
+                break;
+            }
+            result = reader.read_line(&mut line) => {
+                match result {
+                    Ok(0) => {
+                        // EOF received
+                        stdout.write_all(b"\nEOF received. Exiting...\n").await.ok();
+                        stdout.flush().await.ok();
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        stdout.write_all(b"\nRead error. Exiting...\n").await.ok();
+                        stdout.flush().await.ok();
+                        break;
+                    }
+                }
+            }
         }
-        let line = line.trim();
-        if line.is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
         let cmd = parts[0].to_lowercase();
         let rest = parts.get(1).unwrap_or(&"").trim();
 
         match cmd.as_str() {
             "exit" | "quit" | "q" => {
-                println!("Goodbye.");
+                stdout.write_all(b"Goodbye.\n").await.ok();
+                stdout.flush().await.ok();
                 break;
             }
-            "help" => println!("{}", HELP),
+            "help" => {
+                stdout.write_all(HELP.as_bytes()).await.ok();
+                stdout.write_all(b"\n").await.ok();
+                stdout.flush().await.ok();
+            }
             "query" => {
                 if rest.is_empty() {
                     println!("Usage: query <sql>");

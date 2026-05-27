@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, instrument, warn};
 
 static PUBLIC_RPCS: &[&str] = &[
     "https://api.mainnet-beta.solana.com",
@@ -10,8 +14,82 @@ static PUBLIC_RPCS: &[&str] = &[
     "https://rpc.ankr.com/solana",
 ];
 
-pub struct SolanaRpcClient {
+/// Health score for an RPC endpoint
+#[derive(Debug, Clone)]
+struct EndpointHealth {
     endpoint: String,
+    success_count: u64,
+    failure_count: u64,
+    last_latency_ms: Option<u64>,
+    last_check: Option<Instant>,
+    is_healthy: bool,
+}
+
+impl EndpointHealth {
+    fn new(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            success_count: 0,
+            failure_count: 0,
+            last_latency_ms: None,
+            last_check: None,
+            is_healthy: true,
+        }
+    }
+
+    fn score(&self) -> f64 {
+        if !self.is_healthy {
+            return 0.0;
+        }
+
+        let total_requests = self.success_count + self.failure_count;
+        if total_requests == 0 {
+            return 100.0; // New endpoint gets max score
+        }
+
+        let success_rate = self.success_count as f64 / total_requests as f64;
+        let latency_score = match self.last_latency_ms {
+            Some(lat) => (1000.0 / (lat as f64 + 100.0)).min(1.0),
+            None => 0.5,
+        };
+
+        (success_rate * 0.7 + latency_score * 0.3) * 100.0
+    }
+
+    fn record_success(&mut self, latency_ms: u64) {
+        self.success_count += 1;
+        self.last_latency_ms = Some(latency_ms);
+        self.last_check = Some(Instant::now());
+        self.is_healthy = true;
+    }
+
+    fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_check = Some(Instant::now());
+
+        // Mark unhealthy if failure rate > 50% and > 5 failures
+        let total = self.success_count + self.failure_count;
+        if total > 5 && (self.failure_count as f64 / total as f64) > 0.5 {
+            self.is_healthy = false;
+        }
+    }
+
+    fn should_retry(&self) -> bool {
+        if self.is_healthy {
+            return true;
+        }
+
+        // Retry unhealthy endpoints after 5 minutes
+        if let Some(last) = self.last_check {
+            last.elapsed() > Duration::from_secs(300)
+        } else {
+            true
+        }
+    }
+}
+
+pub struct SolanaRpcClient {
+    endpoints: Arc<RwLock<Vec<EndpointHealth>>>,
     client: Client,
     id_counter: AtomicU64,
 }
@@ -19,7 +97,7 @@ pub struct SolanaRpcClient {
 impl Clone for SolanaRpcClient {
     fn clone(&self) -> Self {
         Self {
-            endpoint: self.endpoint.clone(),
+            endpoints: Arc::clone(&self.endpoints),
             client: self.client.clone(),
             id_counter: AtomicU64::new(0),
         }
@@ -28,20 +106,44 @@ impl Clone for SolanaRpcClient {
 
 impl SolanaRpcClient {
     pub fn new(endpoint: Option<String>) -> Self {
-        let endpoint = endpoint
-            .or_else(|| env::var("SOLANA_RPC_ENDPOINT").ok())
-            .unwrap_or_else(|| PUBLIC_RPCS[0].to_string());
+        let endpoints = if let Some(custom) = endpoint.or_else(|| env::var("SOLANA_RPC_ENDPOINT").ok()) {
+            vec![EndpointHealth::new(custom)]
+        } else {
+            PUBLIC_RPCS.iter().map(|s| EndpointHealth::new(s.to_string())).collect()
+        };
+
         Self {
-            endpoint,
+            endpoints: Arc::new(RwLock::new(endpoints)),
             client: Client::new(),
             id_counter: AtomicU64::new(0),
         }
     }
 
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    pub fn endpoint(&self) -> String {
+        let endpoints = self.endpoints.blocking_read();
+        // Return the highest-scoring endpoint
+        endpoints
+            .iter()
+            .max_by(|a, b| a.score().partial_cmp(&b.score()).unwrap())
+            .map(|h| h.endpoint.clone())
+            .unwrap_or_else(|| PUBLIC_RPCS[0].to_string())
     }
 
+    async fn record_success(&self, endpoint: &str, latency_ms: u64) {
+        let mut endpoints = self.endpoints.write().await;
+        if let Some(health) = endpoints.iter_mut().find(|h| h.endpoint == endpoint) {
+            health.record_success(latency_ms);
+        }
+    }
+
+    async fn record_failure(&self, endpoint: &str) {
+        let mut endpoints = self.endpoints.write().await;
+        if let Some(health) = endpoints.iter_mut().find(|h| h.endpoint == endpoint) {
+            health.record_failure();
+        }
+    }
+
+    #[instrument(skip(self, params), fields(method = %method))]
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let id = self.id_counter.fetch_add(1, Ordering::SeqCst);
         let body = json!({
@@ -51,32 +153,88 @@ impl SolanaRpcClient {
             "params": params,
         });
 
-        let resp = self
-            .client
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        debug!("RPC request: {} with params: {}", method, params);
 
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
+        // Try each endpoint with failover
+        let mut last_error = None;
+        let endpoints = self.endpoints.read().await;
 
-        if !status.is_success() {
-            return Err(RpcError::Http(status.as_u16(), text));
+        for health in endpoints.iter() {
+            if !health.should_retry() {
+                warn!("Skipping unhealthy endpoint: {} (score: {:.1})", health.endpoint, health.score());
+                continue;
+            }
+
+            let endpoint = health.endpoint.clone();
+            let score = health.score();
+            debug!("Trying endpoint: {} (score: {:.1})", endpoint, score);
+
+            let start = std::time::Instant::now();
+            let result = self
+                .client
+                .post(&endpoint)
+                .json(&body)
+                .send()
+                .await;
+
+            let elapsed = start.elapsed();
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = match resp.text().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!("RPC response read error for {}: {}", method, e);
+                            self.record_failure(&endpoint).await;
+                            last_error = Some(RpcError::Transport(e.to_string()));
+                            continue;
+                        }
+                    };
+
+                    debug!("RPC response for {} from {} in {:?}", method, endpoint, elapsed);
+
+                    if !status.is_success() {
+                        error!("RPC HTTP error for {}: {} - {}", method, status, text);
+                        self.record_failure(&endpoint).await;
+                        last_error = Some(RpcError::Http(status.as_u16(), text));
+                        continue;
+                    }
+
+                    let json_resp: RpcResponse = match serde_json::from_str(&text) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("RPC parse error for {}: {}", method, e);
+                            self.record_failure(&endpoint).await;
+                            last_error = Some(RpcError::Parse(e.to_string()));
+                            continue;
+                        }
+                    };
+
+                    if let Some(err) = json_resp.error {
+                        error!("RPC error for {}: code={}, message={}", method, err.code, err.message);
+                        self.record_failure(&endpoint).await;
+                        last_error = Some(RpcError::Rpc(err.code, err.message));
+                        continue;
+                    }
+
+                    // Success - record health and return
+                    self.record_success(&endpoint, elapsed.as_millis() as u64).await;
+                    info!("RPC success: {} from {} in {:?}", method, endpoint, elapsed);
+                    return Ok(json_resp.result.unwrap_or(Value::Null));
+                }
+                Err(e) => {
+                    error!("RPC transport error for {} from {}: {}", method, endpoint, e);
+                    self.record_failure(&endpoint).await;
+                    last_error = Some(RpcError::Transport(e.to_string()));
+                    continue;
+                }
+            }
         }
 
-        let json_resp: RpcResponse = serde_json::from_str(&text)
-            .map_err(|e| RpcError::Parse(e.to_string()))?;
-
-        if let Some(err) = json_resp.error {
-            return Err(RpcError::Rpc(err.code, err.message));
-        }
-
-        Ok(json_resp.result.unwrap_or(Value::Null))
+        // All endpoints failed
+        error!("All RPC endpoints failed for method: {}", method);
+        Err(last_error.unwrap_or_else(|| RpcError::Transport("No available endpoints".to_string())))
     }
 
     // ---- Account methods ----

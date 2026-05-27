@@ -249,10 +249,9 @@ fn test_zk_proofs() -> Result<(), Box<dyn std::error::Error>> {
     proof_system.setup()?;
     
     let circuit = StateTransitionCircuit::new(
-        ark_bn254::Fr::from(1u32),
-        ark_bn254::Fr::from(2u32),
+        ark_bn254::Fr::from(10u32),
+        ark_bn254::Fr::from(13u32),
         ark_bn254::Fr::from(3u32),
-        ark_bn254::Fr::from(4u32),
     );
     
     let proof = proof_system.generate_proof(&circuit)?;
@@ -308,7 +307,7 @@ fn test_api_versioning() -> Result<(), Box<dyn std::error::Error>> {
     
     assert!(v1.is_compatible(&v2));
     
-    let parsed = ApiVersion::from_str("1.2.3")?;
+    let parsed = ApiVersion::parse_version("1.2.3")?;
     assert_eq!(parsed.major, 1);
     assert_eq!(parsed.minor, 2);
     assert_eq!(parsed.patch, 3);

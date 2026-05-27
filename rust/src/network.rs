@@ -10,9 +10,12 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::interval;
+use tracing;
 
 use crate::{Block, Transaction};
 
@@ -50,17 +53,31 @@ pub struct P2PNode {
     swarm: libp2p::Swarm<BlockchainNetworkBehaviour>,
     block_topic: gossipsub::IdentTopic,
     transaction_topic: gossipsub::IdentTopic,
-    #[allow(dead_code)]
     message_sender: mpsc::UnboundedSender<NetworkMessage>,
+    bootstrap_peers: Vec<libp2p::Multiaddr>,
+    connected_peers: HashSet<PeerId>,
 }
 
 impl P2PNode {
-    /// Create a new P2P node
+    /// Create a new P2P node.
+    /// Returns the node and an unbounded receiver for incoming network messages.
     pub fn new(
         keypair: Keypair,
-        message_sender: mpsc::UnboundedSender<NetworkMessage>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        config: &NetworkConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<NetworkMessage>), Box<dyn std::error::Error>> {
         let peer_id = PeerId::from(keypair.public());
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Parse bootstrap peers
+        let mut bootstrap_peers = Vec::new();
+        for addr_str in &config.bootstrap_peers {
+            if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                bootstrap_peers.push(addr);
+            } else {
+                tracing::warn!("Invalid bootstrap peer address: {}", addr_str);
+            }
+        }
 
         // Create gossipsub configuration
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -98,12 +115,16 @@ impl P2PNode {
         let block_topic = gossipsub::IdentTopic::new("llm-mina-blocks");
         let transaction_topic = gossipsub::IdentTopic::new("llm-mina-transactions");
 
-        Ok(P2PNode {
+        let node = P2PNode {
             swarm,
             block_topic,
             transaction_topic,
-            message_sender,
-        })
+            message_sender: tx,
+            bootstrap_peers,
+            connected_peers: HashSet::new(),
+        };
+
+        Ok((node, rx))
     }
 
     /// Start listening on the given address
@@ -155,32 +176,115 @@ impl P2PNode {
         Ok(())
     }
 
-    /// Run the network event loop
+    /// Run the network event loop with reconnect logic
     pub async fn run(&mut self) {
         use futures::StreamExt;
+        let mut reconnect_tick = interval(Duration::from_secs(30));
+
+        // Initial dial of bootstrap peers
+        self.dial_bootstrap_peers();
+
         loop {
-            match self.swarm.select_next_some().await {
-                SwarmEvent::Behaviour(event) => {
-                    // Simplified event handling for demo purposes
-                    // In production, this would handle gossipsub and mDNS events
-                    let _ = event;
+            tokio::select! {
+                _ = reconnect_tick.tick() => {
+                    self.dial_bootstrap_peers();
                 }
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    tracing::info!("Listening on {}", address);
+
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event);
                 }
-                _ => {}
+            }
+        }
+    }
+
+    /// Handle a swarm event
+    fn handle_swarm_event(&mut self, event: SwarmEvent<BlockchainNetworkBehaviourEvent>) {
+        match event {
+            SwarmEvent::Behaviour(BlockchainNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source: _,
+                message_id: _,
+                message,
+            })) => {
+                match serde_json::from_slice::<NetworkMessage>(&message.data) {
+                    Ok(net_msg) => {
+                        let _ = self.message_sender.send(net_msg);
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to deserialize network message: {}", e);
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BlockchainNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                tracing::info!("Peer {} subscribed to {}", peer_id, topic);
+            }
+            SwarmEvent::Behaviour(BlockchainNetworkBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+                tracing::info!("Peer {} unsubscribed from {}", peer_id, topic);
+            }
+            SwarmEvent::Behaviour(BlockchainNetworkBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
+                tracing::warn!("Peer {} does not support gossipsub", peer_id);
+            }
+            SwarmEvent::Behaviour(BlockchainNetworkBehaviourEvent::Mdns(event)) => {
+                match event {
+                    mdns::Event::Discovered(list) => {
+                        for (peer_id, _addr) in list {
+                            tracing::info!("mDNS discovered peer {}", peer_id);
+                        }
+                    }
+                    mdns::Event::Expired(list) => {
+                        for (peer_id, _addr) in list {
+                            tracing::info!("mDNS expired peer {}", peer_id);
+                        }
+                    }
+                }
+            }
+
+            SwarmEvent::NewListenAddr { address, .. } => {
+                tracing::info!("Listening on {}", address);
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                self.connected_peers.insert(peer_id);
+                tracing::info!("Connected to {} (total peers: {})", peer_id, self.connected_peers.len());
+            }
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                self.connected_peers.remove(&peer_id);
+                if let Some(cause) = cause {
+                    tracing::warn!("Disconnected from {}: {:?}", peer_id, cause);
+                } else {
+                    tracing::info!("Disconnected from {}", peer_id);
+                }
+            }
+            SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => {
+                tracing::warn!("Incoming connection error from {}: {}", send_back_addr, error);
+            }
+            SwarmEvent::Dialing { peer_id, connection_id: _ } => {
+                tracing::debug!("Dialing {}", peer_id.map_or("unknown".to_string(), |p| p.to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Dial all bootstrap peers that are not currently connected
+    fn dial_bootstrap_peers(&mut self) {
+        for addr in &self.bootstrap_peers {
+            if let Err(e) = self.swarm.dial(addr.clone()) {
+                tracing::debug!("Failed to dial bootstrap peer {}: {}", addr, e);
             }
         }
     }
 
     /// Get connected peers
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.swarm.connected_peers().copied().collect()
+        self.connected_peers.iter().copied().collect()
     }
 
     /// Get peer ID
     pub fn peer_id(&self) -> PeerId {
         *self.swarm.local_peer_id()
+    }
+
+    /// Get number of connected peers
+    pub fn peer_count(&self) -> usize {
+        self.connected_peers.len()
     }
 }
 
